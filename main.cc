@@ -50,12 +50,12 @@ public:
     const auto global_bounding_boxes =
       Utilities::MPI::all_gather(comm, local_reduced_box);
 
-    // determine ranks which might posses quadrature point
-    std::vector<std::vector<Point<spacedim>>> points_per_process(
-      global_bounding_boxes.size());
+    // determine ranks which might poses quadrature point
+    auto points_per_process =
+      std::vector<std::vector<Point<spacedim>>>(global_bounding_boxes.size());
 
-    std::vector<std::vector<unsigned int>> points_per_process_offset(
-      global_bounding_boxes.size());
+    auto points_per_process_offset =
+      std::vector<std::vector<unsigned int>>(global_bounding_boxes.size());
 
     for (unsigned int i = 0; i < quadrature_points.size(); ++i)
       {
@@ -77,10 +77,6 @@ public:
           i != Utilities::MPI::this_mpi_process(comm))
         targets.emplace_back(i);
 
-    // for local quadrature points no communication is needed...
-    local_quadrature_points =
-      points_per_process[Utilities::MPI::this_mpi_process(comm)];
-
 
     std::map<unsigned int, std::vector<Point<spacedim>>>
       relevant_points_per_process;
@@ -88,6 +84,49 @@ public:
       relevant_points_per_process_offset;
     std::map<unsigned int, std::vector<unsigned int>>
       relevant_points_per_process_count;
+
+
+    // for local quadrature points no communication is needed...
+    {
+      const unsigned int my_rank = Utilities::MPI::this_mpi_process(comm);
+
+      const auto &potentially_local_points = points_per_process[my_rank];
+
+
+      {
+        std::vector<Point<spacedim>> points;
+        std::vector<unsigned int>    points_offset;
+        std::vector<unsigned int>    count;
+
+        const auto &potentially_relevant_points = points_per_process[my_rank];
+        const auto &potentially_relevant_points_offset =
+          points_per_process_offset[my_rank];
+
+        for (unsigned int j = 0; j < potentially_local_points.size(); ++j)
+          {
+            const unsigned int counter = j % 4; // TODO
+
+            if (counter > 0)
+              {
+                points.push_back(potentially_relevant_points[j]);
+                points_offset.push_back(potentially_relevant_points_offset[j]);
+                count.push_back(counter);
+              }
+          }
+
+
+        if (points.size() > 0)
+          {
+            relevant_remote_points_per_process[my_rank]       = points;
+            relevant_remote_points_count_per_process[my_rank] = count;
+
+            relevant_points_per_process[my_rank]        = points;
+            relevant_points_per_process_offset[my_rank] = points_offset;
+            relevant_points_per_process_count[my_rank]  = count;
+            map_recv[my_rank]                           = points;
+          }
+      }
+    }
 
     // send to remote ranks the requested quadrature points and eliminate
     // not needed ones (note: currently, we cannot communicate points ->
@@ -120,7 +159,7 @@ public:
               for (unsigned int j = 0; j < spacedim; ++j)
                 point[j] = recv_buffer[i + j];
 
-              unsigned int counter = j % 4; // TODO
+              const unsigned int counter = j % 4; // TODO
 
               request_buffer[j] = counter;
 
@@ -281,10 +320,16 @@ public:
     // receive result
 
     std::map<unsigned int, std::vector<std::vector<T>>> temp_recv_map;
-    // temp_recv_map[my_rank] = input[my_rank];  //TODO
 
-    for (unsigned int counter = 0; counter < map_recv.size(); ++counter)
+    // process locally-owned values
+    if (input.find(my_rank) != input.end())
+      temp_recv_map[my_rank] = input.at(my_rank);
+
+    for (const auto &vec : map_recv)
       {
+        if (vec.first == my_rank)
+          continue;
+
         MPI_Status status;
         MPI_Probe(MPI_ANY_SOURCE, 11, comm, &status);
 
@@ -325,15 +370,10 @@ public:
   /**
    * Return quadrature points (sorted according to rank).
    */
-  std::map<unsigned int, std::vector<Point<spacedim>>>
-  get_quadrature_points() const
+  const std::map<unsigned int, std::vector<Point<spacedim>>> &
+  get_remote_quadrature_points() const
   {
-    auto result = map_recv;
-
-    result[Utilities::MPI::this_mpi_process(comm)] =
-      this->local_quadrature_points;
-
-    return result;
+    return relevant_remote_points_per_process;
   }
 
   /**
@@ -343,10 +383,6 @@ public:
   print() const
   {
     std::cout << "Locally owned quadrature points:" << std::endl;
-
-    for (const auto &point : local_quadrature_points)
-      std::cout << point << std::endl;
-    std::cout << std::endl;
 
     for (const auto &i : map_recv)
       {
@@ -379,7 +415,6 @@ private:
   std::map<unsigned int, std::vector<Point<spacedim>>> map_recv;
 
   // sender side (TODO: merge)
-  std::vector<Point<spacedim>> local_quadrature_points;
   std::map<unsigned int, std::vector<Point<spacedim>>>
     relevant_remote_points_per_process;
   std::map<unsigned int, std::vector<unsigned int>>
@@ -440,14 +475,28 @@ test(const MPI_Comm &comm)
     surface_quadrature_points, tria_fluid);
 
   // Ic) allocate memory
+  std::vector<std::vector<Tensor<1, spacedim>>> surface_values;
+  eval.init_surface_values(surface_values);
+
   std::map<unsigned int, std::vector<std::vector<Tensor<1, spacedim>>>>
     intermediate_values;
   eval.init_intermediate_values(intermediate_values);
 
-  std::vector<std::vector<Tensor<1, spacedim>>> surface_values;
-  eval.init_surface_values(surface_values);
+  // IIa) fill intermediate values
+  const auto &remote_quadrature_point_per_process =
+    eval.get_remote_quadrature_points();
 
-  // IIa) fill intermediate values (TODO)
+  for (auto &p : intermediate_values)
+    {
+      const unsigned int rank   = p.first;
+      auto &             values = p.second;
+      const auto &       quadrature_points =
+        remote_quadrature_point_per_process.at(rank);
+
+      for (unsigned int i = 0; i < values.size(); ++i)
+        for (unsigned int j = 0; j < values[j].size(); ++j)
+          values[i][j] = quadrature_points[i]; // TODO: do something useful
+    }
 
   // IIb) communicate values
   eval.process(/*src=*/intermediate_values, /*dst=*/surface_values);

@@ -274,7 +274,7 @@ public:
         std::vector<std::vector<T>> temp(i.second.size());
 
         for (unsigned int j = 0; j < i.second.size(); ++j)
-          temp.resize(i.second[j]);
+          temp[j].resize(i.second[j]);
 
         input[rank] = temp;
       }
@@ -494,7 +494,7 @@ test(const MPI_Comm &comm)
         remote_quadrature_point_per_process.at(rank);
 
       for (unsigned int i = 0; i < values.size(); ++i)
-        for (unsigned int j = 0; j < values[j].size(); ++j)
+        for (unsigned int j = 0; j < values[i].size(); ++j)
           values[i][j] = quadrature_points[i]; // TODO: do something useful
     }
 

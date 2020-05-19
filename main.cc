@@ -107,8 +107,8 @@ public:
           // received points, determine if point is actually possessed, and
           // send the result back
 
-          std::vector<Point<spacedim>> relevant_points;
-          std::vector<unsigned int>    relevant_points_count;
+          std::vector<Point<spacedim>> relevant_remote_points;
+          std::vector<unsigned int>    relevant_remote_points_count;
 
           request_buffer.clear();
           request_buffer.resize(recv_buffer.size() / spacedim);
@@ -120,20 +120,23 @@ public:
               for (unsigned int j = 0; j < spacedim; ++j)
                 point[j] = recv_buffer[i + j];
 
-              unsigned int counter = 1; // TODO
+              unsigned int counter = j % 4; // TODO
 
               request_buffer[j] = counter;
 
               if (counter > 0)
                 {
-                  relevant_points.push_back(point);
-                  relevant_points_count.push_back(counter);
+                  relevant_remote_points.push_back(point);
+                  relevant_remote_points_count.push_back(counter);
                 }
             }
 
-          if (relevant_points.size() > 0)
+          if (relevant_remote_points.size() > 0)
             {
-              map_send[other_rank] = relevant_points;
+              relevant_remote_points_per_process[other_rank] =
+                relevant_remote_points;
+              relevant_remote_points_count_per_process[other_rank] =
+                relevant_remote_points_count;
             }
         },
         [&](const unsigned int         other_rank,
@@ -176,9 +179,7 @@ public:
             }
         });
 
-    Utilities::MPI::ConsensusAlgorithms::Selector<double, unsigned int>(process,
-                                                                        comm)
-      .run();
+    Utilities::MPI::ConsensusAlgorithms::Selector(process, comm).run();
 
     quadrature_points_count.resize(quadrature_points.size(), 0);
 
@@ -212,39 +213,57 @@ public:
       }
   }
 
+  template <typename T>
+  void
+  init_surface_values(std::vector<std::vector<T>> &output) const
+  {
+    output.resize(quadrature_points_count.size());
+
+    for (unsigned int i = 0; i < quadrature_points_count.size(); ++i)
+      output[i].resize(quadrature_points_count[i]);
+  }
+
+  template <typename T>
+  void
+  init_intermediate_values(
+    std::map<unsigned int, std::vector<std::vector<T>>> &input) const
+  {
+    for (const auto &i : this->relevant_remote_points_count_per_process)
+      {
+        const unsigned int rank = i.first;
+
+        std::vector<std::vector<T>> temp(i.second.size());
+
+        for (unsigned int j = 0; j < i.second.size(); ++j)
+          temp.resize(i.second[j]);
+
+        input[rank] = temp;
+      }
+  }
+
   /**
    * Evaluate function @p fu in the requested quadrature points. The result
    * is sorted according to rank.
    */
   template <typename T>
-  std::map<unsigned int, std::vector<T>>
-  process(const std::function<T(Point<spacedim>)> &fu) const
+  void
+  process(const std::map<unsigned int, std::vector<std::vector<T>>> &input,
+          std::vector<std::vector<T>> &output) const
   {
-    std::map<unsigned int, std::vector<T>> result;
-
-    // process local quadrature points
-    {
-      std::vector<T> temp;
-      temp.reserve(local_quadrature_points.size());
-      for (auto p : local_quadrature_points)
-        temp.push_back(fu(p));
-      result[Utilities::MPI::this_mpi_process(comm)] = temp;
-    }
-
     // process remote quadrature points and send them away
     std::map<unsigned int, std::vector<char>> temp_map;
 
     std::vector<MPI_Request> requests;
-    requests.reserve(map_send.size());
+    requests.reserve(input.size());
 
-    for (const auto &vec : map_send)
+    const unsigned int my_rank = Utilities::MPI::this_mpi_process(comm);
+
+    for (const auto &vec : input)
       {
-        std::vector<T> temp;
-        temp.reserve(vec.second.size());
+        if (vec.first == my_rank)
+          continue;
 
-        for (auto p : vec.second)
-          temp.push_back(fu(p));
-        temp_map[vec.first] = Utilities::pack(temp);
+        temp_map[vec.first] = Utilities::pack(vec.second);
 
         auto &buffer = temp_map[vec.first];
 
@@ -260,6 +279,10 @@ public:
       }
 
     // receive result
+
+    std::map<unsigned int, std::vector<std::vector<T>>> temp_recv_map;
+    // temp_recv_map[my_rank] = input[my_rank];  //TODO
+
     for (unsigned int counter = 0; counter < map_recv.size(); ++counter)
       {
         MPI_Status status;
@@ -278,12 +301,25 @@ public:
                  comm,
                  MPI_STATUS_IGNORE);
 
-        result[status.MPI_SOURCE] = Utilities::unpack<std::vector<T>>(buffer);
+        temp_recv_map[status.MPI_SOURCE] =
+          Utilities::unpack<std::vector<std::vector<T>>>(buffer);
       }
 
     MPI_Waitall(requests.size(), requests.data(), MPI_STATUSES_IGNORE);
 
-    return result;
+    for (const auto &i : temp_recv_map)
+      {
+        const unsigned int rank = i.first;
+
+        auto it = indices_per_process.at(rank).begin();
+
+        for (const auto &i : temp_recv_map[rank])
+          for (const auto &j : i)
+            {
+              output[it->first][it->second] = j;
+              ++it;
+            }
+      }
   }
 
   /**
@@ -322,7 +358,7 @@ public:
         std::cout << std::endl;
       }
 
-    for (const auto &i : map_send)
+    for (const auto &i : relevant_remote_points_per_process)
       {
         std::cout << "Send to " << i.first << ":" << std::endl;
 
@@ -343,15 +379,18 @@ private:
   std::map<unsigned int, std::vector<Point<spacedim>>> map_recv;
 
   // sender side (TODO: merge)
-  std::vector<Point<spacedim>>                         local_quadrature_points;
-  std::map<unsigned int, std::vector<Point<spacedim>>> map_send;
+  std::vector<Point<spacedim>> local_quadrature_points;
+  std::map<unsigned int, std::vector<Point<spacedim>>>
+    relevant_remote_points_per_process;
+  std::map<unsigned int, std::vector<unsigned int>>
+    relevant_remote_points_count_per_process;
 };
 
 template <int dim, int spacedim>
 void
 test(const MPI_Comm &comm)
 {
-  // 1) create mesh
+  // Ia) create mesh
   parallel::distributed::Triangulation<dim, spacedim> tria_solid(comm);
   GridGenerator::hyper_ball(tria_solid);
   tria_solid.refine_global(3);
@@ -396,28 +435,31 @@ test(const MPI_Comm &comm)
         }
     }
 
-  // 3) setup communication pattern
-  RemoteQuadraturePointEvaluator<dim, spacedim> eval(surface_quadrature_points,
-                                                     tria_fluid);
+  // Ib) setup communication pattern
+  const RemoteQuadraturePointEvaluator<dim, spacedim> eval(
+    surface_quadrature_points, tria_fluid);
 
-  // 4) get quadrature points (sorted according rank)
-  std::map<unsigned int, std::vector<Point<spacedim>>> results_points =
-    eval.get_quadrature_points();
+  // Ic) allocate memory
+  std::map<unsigned int, std::vector<std::vector<Tensor<1, spacedim>>>>
+    intermediate_values;
+  eval.init_intermediate_values(intermediate_values);
 
-  // 5) compute derived quantities at quadrature points and get results (sorted
-  // according rank)
-  std::map<unsigned int, std::vector<Tensor<1, spacedim>>> results_values =
-    eval.template process<Tensor<1, spacedim>>(
-      [](const auto &point) { return point; });
+  std::vector<std::vector<Tensor<1, spacedim>>> surface_values;
+  eval.init_surface_values(surface_values);
 
-  // 6) print results
-  for (const auto &ranks_and_points : results_points)
+  // IIa) fill intermediate values (TODO)
+
+  // IIb) communicate values
+  eval.process(/*src=*/intermediate_values, /*dst=*/surface_values);
+
+  // IIc) use surface values
+  for (unsigned int i = 0; i < surface_values.size(); ++i)
     {
-      const auto &values = results_values[ranks_and_points.first];
+      std::cout << surface_quadrature_points[i] << " ";
 
-      for (unsigned int i = 0; i < values.size(); ++i)
-        std::cout << ranks_and_points.second[i] << " " << values[i]
-                  << std::endl;
+      for (const auto &value : surface_values[i])
+        std::cout << value << " ";
+
       std::cout << std::endl;
     }
 }

@@ -23,8 +23,8 @@ class RemoteQuadraturePointEvaluator
 public:
   /**
    * Constructor.
-   * 
-   * @param quadrature_points quadrature points at which function should be 
+   *
+   * @param quadrature_points quadrature points at which function should be
    *   evaluated
    * @param tria_fluid (partitioned) triangulation on which results should be
    *   evaluated
@@ -41,8 +41,8 @@ public:
         local_boxes.push_back(cell->bounding_box());
 
     // create r-tree of bounding boxes
-    const auto local_tree        = pack_rtree(local_boxes);
-    
+    const auto local_tree = pack_rtree(local_boxes);
+
     // compress r-tree to a minimal set of bounding boxes
     const auto local_reduced_box = extract_rtree_level(local_tree, 0);
 
@@ -50,15 +50,24 @@ public:
     const auto global_bounding_boxes =
       Utilities::MPI::all_gather(comm, local_reduced_box);
 
-    // determine ranks which might posses quadrature point 
+    // determine ranks which might posses quadrature point
     std::vector<std::vector<Point<spacedim>>> points_per_process(
       global_bounding_boxes.size());
 
-    for (const auto &point : quadrature_points)
-      for (unsigned i = 0; i < global_bounding_boxes.size(); ++i)
-        for (const auto &box : global_bounding_boxes[i])
-          if (box.point_inside(point))
-            points_per_process[i].emplace_back(point);
+    std::vector<std::vector<unsigned int>> points_per_process_offset(
+      global_bounding_boxes.size());
+
+    for (unsigned int i = 0; i < quadrature_points.size(); ++i)
+      {
+        const auto &point = quadrature_points[i];
+        for (unsigned rank = 0; rank < global_bounding_boxes.size(); ++rank)
+          for (const auto &box : global_bounding_boxes[rank])
+            if (box.point_inside(point))
+              {
+                points_per_process[rank].emplace_back(point);
+                points_per_process_offset[rank].emplace_back(i);
+              }
+      }
 
     // only communicate with processes that might have a quadrature point
     std::vector<unsigned int> targets;
@@ -72,10 +81,18 @@ public:
     local_quadrature_points =
       points_per_process[Utilities::MPI::this_mpi_process(comm)];
 
+
+    std::map<unsigned int, std::vector<Point<spacedim>>>
+      relevant_points_per_process;
+    std::map<unsigned int, std::vector<unsigned int>>
+      relevant_points_per_process_offset;
+    std::map<unsigned int, std::vector<unsigned int>>
+      relevant_points_per_process_count;
+
     // send to remote ranks the requested quadrature points and eliminate
     // not needed ones (note: currently, we cannot communicate points ->
     // switch to doubles here)
-    Utilities::MPI::ConsensusAlgorithms::AnonymousProcess<double, double>
+    Utilities::MPI::ConsensusAlgorithms::AnonymousProcess<double, unsigned int>
       process(
         [&]() { return targets; },
         [&](const unsigned int other_rank, std::vector<double> &send_buffer) {
@@ -86,74 +103,113 @@ public:
         },
         [&](const unsigned int &       other_rank,
             const std::vector<double> &recv_buffer,
-            std::vector<double> &      request_buffer) {
+            std::vector<unsigned int> &request_buffer) {
           // received points, determine if point is actually possessed, and
           // send the result back
-            
-          std::vector<Point<spacedim>> points;
 
-          request_buffer.resize(recv_buffer.size());
+          std::vector<Point<spacedim>> relevant_points;
+          std::vector<unsigned int>    relevant_points_count;
 
-          for (unsigned int i = 0; i < recv_buffer.size(); i += spacedim)
+          request_buffer.clear();
+          request_buffer.resize(recv_buffer.size() / spacedim);
+
+          for (unsigned int i = 0, j = 0; i < recv_buffer.size();
+               i += spacedim, ++j)
             {
               Point<spacedim> point;
               for (unsigned int j = 0; j < spacedim; ++j)
                 point[j] = recv_buffer[i + j];
 
-              bool found = false;
+              unsigned int counter = 1; // TODO
 
-              for (const auto &box : local_boxes)
-                if (box.point_inside(point))
-                  {
-                    points.push_back(point);
+              request_buffer[j] = counter;
 
-                    for (unsigned int j = 0; j < spacedim; ++j)
-                      request_buffer[i + j] = recv_buffer[i + j];
-
-
-                    found = true;
-
-                    break;
-                  }
-
-              if (found)
-                continue;
-
-              for (unsigned int j = 0; j < spacedim; ++j)
-                request_buffer[i + j] = std::numeric_limits<double>::max();
+              if (counter > 0)
+                {
+                  relevant_points.push_back(point);
+                  relevant_points_count.push_back(counter);
+                }
             }
 
-          if (points.size() > 0)
-            map_send[other_rank] = points;
-        },
-        [&](const unsigned int other_rank, std::vector<double> &recv_buffer) {
-            // prepare buffer
-          recv_buffer.resize(spacedim * points_per_process[other_rank].size());
+          if (relevant_points.size() > 0)
+            {
+              map_send[other_rank] = relevant_points;
+            }
         },
         [&](const unsigned int         other_rank,
-            const std::vector<double> &recv_buffer) {
-          // receive points, which are actually owned by other process
+            std::vector<unsigned int> &recv_buffer) {
+          // prepare buffer
+          recv_buffer.resize(points_per_process[other_rank].size());
+        },
+        [&](const unsigned int               other_rank,
+            const std::vector<unsigned int> &recv_buffer) {
+          // store recv_buffer -> make the algorithm deterministic
+
+          const auto &potentially_relevant_points =
+            points_per_process[other_rank];
+          const auto &potentially_relevant_points_offset =
+            points_per_process_offset[other_rank];
+
           std::vector<Point<spacedim>> points;
+          std::vector<unsigned int>    points_offset;
+          std::vector<unsigned int>    count;
 
-          for (unsigned int i = 0; i < recv_buffer.size(); i += spacedim)
-            {
-              if (recv_buffer[i] == std::numeric_limits<double>::max())
-                continue;
+          AssertDimension(potentially_relevant_points.size(),
+                          recv_buffer.size());
+          AssertDimension(potentially_relevant_points_offset.size(),
+                          recv_buffer.size());
 
-              Point<spacedim> point;
-              for (unsigned int j = 0; j < spacedim; ++j)
-                point[j] = recv_buffer[i + j];
-
-              points.push_back(point);
-            }
+          for (unsigned int i = 0; i < recv_buffer.size(); ++i)
+            if (recv_buffer[i] > 0)
+              {
+                points.push_back(potentially_relevant_points[i]);
+                points_offset.push_back(potentially_relevant_points_offset[i]);
+                count.push_back(recv_buffer[i]);
+              }
 
           if (points.size() > 0)
-            map_recv[other_rank] = points;
+            {
+              relevant_points_per_process[other_rank]        = points;
+              relevant_points_per_process_offset[other_rank] = points_offset;
+              relevant_points_per_process_count[other_rank]  = count;
+              map_recv[other_rank]                           = points;
+            }
         });
 
-    Utilities::MPI::ConsensusAlgorithms::Selector<double, double>(
-      process, tria.comm)
+    Utilities::MPI::ConsensusAlgorithms::Selector<double, unsigned int>(process,
+                                                                        comm)
       .run();
+
+    quadrature_points_count.resize(quadrature_points.size(), 0);
+
+    for (const auto &i : relevant_points_per_process)
+      {
+        const unsigned int rank = i.first;
+
+        std::vector<std::pair<unsigned int, unsigned int>> indices;
+
+        const auto &relevant_points = relevant_points_per_process[rank];
+        const auto &relevant_points_offset =
+          relevant_points_per_process_offset[rank];
+        const auto &relevant_points_count =
+          relevant_points_per_process_count[rank];
+
+        for (unsigned int j = 0; j < relevant_points.size(); ++j)
+          {
+            for (unsigned int k = 0; k < relevant_points_count[j]; ++k)
+              {
+                AssertIndexRange(relevant_points_offset[j],
+                                 quadrature_points_count.size());
+                auto &qp_counter =
+                  quadrature_points_count[relevant_points_offset[j]];
+                indices.emplace_back(relevant_points_offset[j], qp_counter);
+
+                ++qp_counter;
+              }
+          }
+
+        this->indices_per_process[rank] = indices;
+      }
   }
 
   /**
@@ -280,8 +336,14 @@ public:
 private:
   const MPI_Comm &comm;
 
-  std::vector<Point<spacedim>>                         local_quadrature_points;
+  // receiver side
+  std::vector<unsigned int> quadrature_points_count;
+  std::map<unsigned int, std::vector<std::pair<unsigned int, unsigned int>>>
+                                                       indices_per_process;
   std::map<unsigned int, std::vector<Point<spacedim>>> map_recv;
+
+  // sender side (TODO: merge)
+  std::vector<Point<spacedim>>                         local_quadrature_points;
   std::map<unsigned int, std::vector<Point<spacedim>>> map_send;
 };
 

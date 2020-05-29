@@ -12,10 +12,46 @@
 
 #include <deal.II/grid/grid_generator.h>
 #include <deal.II/grid/grid_out.h>
+#include <deal.II/grid/grid_tools.h>
 
 #include <deal.II/numerics/rtree.h>
 
 using namespace dealii;
+
+template <int dim>
+unsigned int
+n_locally_owned_active_cells_around_point(const Triangulation<dim> &tria,
+                                          const Mapping<dim> &      mapping,
+                                          const Point<dim> &        point,
+                                          const double tolerance = 1.e-10)
+{
+  using Pair =
+    std::pair<typename Triangulation<dim>::active_cell_iterator, Point<dim>>;
+
+  std::vector<Pair> adjacent_cells =
+    GridTools::find_all_active_cells_around_point(mapping,
+                                                  tria,
+                                                  point,
+                                                  tolerance);
+
+  // count locally owned active cells
+  unsigned int counter = 0;
+  for (auto cell : adjacent_cells)
+    {
+      if (cell.first->is_locally_owned())
+        {
+          Assert(GeometryInfo<dim>::distance_to_unit_cell(cell.second) < 1e-10,
+                 ExcInternalError());
+
+          ++counter;
+        }
+    }
+
+  std::cout << counter << std::endl;
+
+  return counter;
+}
+
 
 template <int dim, int spacedim>
 class RemoteQuadraturePointEvaluator
@@ -104,7 +140,11 @@ public:
 
         for (unsigned int j = 0; j < potentially_local_points.size(); ++j)
           {
-            const unsigned int counter = j % 4; // TODO
+            const unsigned int counter =
+              n_locally_owned_active_cells_around_point(
+                tria,
+                MappingQ<dim, spacedim>(1) /*TODO*/,
+                potentially_relevant_points[j]); // TODO
 
             if (counter > 0)
               {
@@ -159,7 +199,9 @@ public:
               for (unsigned int j = 0; j < spacedim; ++j)
                 point[j] = recv_buffer[i + j];
 
-              const unsigned int counter = j % 4; // TODO
+              const unsigned int counter =
+                n_locally_owned_active_cells_around_point(
+                  tria, MappingQ<dim, spacedim>(1) /*TODO*/, point);
 
               request_buffer[j] = counter;
 
@@ -218,7 +260,9 @@ public:
             }
         });
 
-    Utilities::MPI::ConsensusAlgorithms::Selector(process, comm).run();
+    Utilities::MPI::ConsensusAlgorithms::Selector<double, unsigned int>(process,
+                                                                        comm)
+      .run();
 
     quadrature_points_count.resize(quadrature_points.size(), 0);
 
@@ -427,11 +471,13 @@ test(const MPI_Comm &comm)
 {
   // Ia) create mesh
   parallel::distributed::Triangulation<dim, spacedim> tria_solid(comm);
-  GridGenerator::hyper_ball(tria_solid);
+  GridGenerator::hyper_cube(tria_solid);
   tria_solid.refine_global(3);
 
   parallel::distributed::Triangulation<dim, spacedim> tria_fluid(comm);
-  GridGenerator::hyper_cube(tria_fluid, -2, 3);
+  GridGenerator::hyper_rectangle(tria_fluid,
+                                 Point<spacedim>(1, 0),
+                                 Point<spacedim>(2, 1));
   tria_fluid.refine_global(4);
 
   GridOut grid_out;
@@ -504,7 +550,11 @@ test(const MPI_Comm &comm)
   // IIc) use surface values
   for (unsigned int i = 0; i < surface_values.size(); ++i)
     {
-      std::cout << surface_quadrature_points[i] << " ";
+      if (surface_values[i].size() == 0)
+        continue;
+
+      std::cout << surface_values[i].size() << " : "
+                << surface_quadrature_points[i] << " ";
 
       for (const auto &value : surface_values[i])
         std::cout << value << " ";

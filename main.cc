@@ -75,7 +75,7 @@ public:
     std::vector<BoundingBox<spacedim>> local_boxes;
     for (const auto cell : tria.active_cell_iterators())
       if (cell->is_locally_owned())
-        local_boxes.push_back(cell->bounding_box());
+        local_boxes.push_back(mapping.get_bounding_box(cell));
 
     // create r-tree of bounding boxes
     const auto local_tree = pack_rtree(local_boxes);

@@ -47,7 +47,6 @@ n_locally_owned_active_cells_around_point(const Triangulation<dim> &tria,
         }
     }
 
-  std::cout << counter << std::endl;
 
   return counter;
 }
@@ -67,7 +66,8 @@ public:
    */
   RemoteQuadraturePointEvaluator(
     const std::vector<Point<spacedim>> quadrature_points,
-    const parallel::distributed::Triangulation<dim, spacedim> &tria)
+    const parallel::distributed::Triangulation<dim, spacedim> &tria,
+    const Mapping<dim, spacedim> &                             mapping)
     : comm(tria.get_communicator())
   {
     // create bounding boxed of local active cells
@@ -102,6 +102,7 @@ public:
               {
                 points_per_process[rank].emplace_back(point);
                 points_per_process_offset[rank].emplace_back(i);
+                break;
               }
       }
 
@@ -143,7 +144,7 @@ public:
             const unsigned int counter =
               n_locally_owned_active_cells_around_point(
                 tria,
-                MappingQ<dim, spacedim>(1) /*TODO*/,
+                mapping,
                 potentially_relevant_points[j]); // TODO
 
             if (counter > 0)
@@ -200,8 +201,7 @@ public:
                 point[j] = recv_buffer[i + j];
 
               const unsigned int counter =
-                n_locally_owned_active_cells_around_point(
-                  tria, MappingQ<dim, spacedim>(1) /*TODO*/, point);
+                n_locally_owned_active_cells_around_point(tria, mapping, point);
 
               request_buffer[j] = counter;
 
@@ -518,7 +518,7 @@ test(const MPI_Comm &comm)
 
   // Ib) setup communication pattern
   const RemoteQuadraturePointEvaluator<dim, spacedim> eval(
-    surface_quadrature_points, tria_fluid);
+    surface_quadrature_points, tria_fluid, mapping);
 
   // Ic) allocate memory
   std::vector<std::vector<Tensor<1, spacedim>>> surface_values;

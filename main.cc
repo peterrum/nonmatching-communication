@@ -23,7 +23,7 @@ unsigned int
 n_locally_owned_active_cells_around_point(const Triangulation<dim> &tria,
                                           const Mapping<dim> &      mapping,
                                           const Point<dim> &        point,
-                                          const double tolerance = 1.e-10)
+                                          const double              tolerance)
 {
   using Pair =
     std::pair<typename Triangulation<dim>::active_cell_iterator, Point<dim>>;
@@ -67,7 +67,8 @@ public:
   RemoteQuadraturePointEvaluator(
     const std::vector<Point<spacedim>> quadrature_points,
     const parallel::distributed::Triangulation<dim, spacedim> &tria,
-    const Mapping<dim, spacedim> &                             mapping)
+    const Mapping<dim, spacedim> &                             mapping,
+    const double                                               tolerance)
     : comm(tria.get_communicator())
   {
     // create bounding boxed of local active cells
@@ -143,9 +144,7 @@ public:
           {
             const unsigned int counter =
               n_locally_owned_active_cells_around_point(
-                tria,
-                mapping,
-                potentially_relevant_points[j]); // TODO
+                tria, mapping, potentially_relevant_points[j], tolerance);
 
             if (counter > 0)
               {
@@ -201,7 +200,10 @@ public:
                 point[j] = recv_buffer[i + j];
 
               const unsigned int counter =
-                n_locally_owned_active_cells_around_point(tria, mapping, point);
+                n_locally_owned_active_cells_around_point(tria,
+                                                          mapping,
+                                                          point,
+                                                          tolerance);
 
               request_buffer[j] = counter;
 
@@ -518,7 +520,7 @@ test(const MPI_Comm &comm)
 
   // Ib) setup communication pattern
   const RemoteQuadraturePointEvaluator<dim, spacedim> eval(
-    surface_quadrature_points, tria_fluid, mapping);
+    surface_quadrature_points, tria_fluid, mapping, 1.e-10);
 
   // Ic) allocate memory
   std::vector<std::vector<Tensor<1, spacedim>>> surface_values;

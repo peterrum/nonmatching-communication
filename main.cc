@@ -12,10 +12,45 @@
 
 #include <deal.II/grid/grid_generator.h>
 #include <deal.II/grid/grid_out.h>
+#include <deal.II/grid/grid_tools.h>
 
 #include <deal.II/numerics/rtree.h>
 
 using namespace dealii;
+
+template <int dim>
+unsigned int
+n_locally_owned_active_cells_around_point(const Triangulation<dim> &tria,
+                                          const Mapping<dim> &      mapping,
+                                          const Point<dim> &        point,
+                                          const double              tolerance)
+{
+  using Pair =
+    std::pair<typename Triangulation<dim>::active_cell_iterator, Point<dim>>;
+
+  std::vector<Pair> adjacent_cells =
+    GridTools::find_all_active_cells_around_point(mapping,
+                                                  tria,
+                                                  point,
+                                                  tolerance);
+
+  // count locally owned active cells
+  unsigned int counter = 0;
+  for (auto cell : adjacent_cells)
+    {
+      if (cell.first->is_locally_owned())
+        {
+          Assert(GeometryInfo<dim>::distance_to_unit_cell(cell.second) < 1e-10,
+                 ExcInternalError());
+
+          ++counter;
+        }
+    }
+
+
+  return counter;
+}
+
 
 template <int dim, int spacedim>
 class RemoteQuadraturePointEvaluator
@@ -23,26 +58,28 @@ class RemoteQuadraturePointEvaluator
 public:
   /**
    * Constructor.
-   * 
-   * @param quadrature_points quadrature points at which function should be 
+   *
+   * @param quadrature_points quadrature points at which function should be
    *   evaluated
    * @param tria_fluid (partitioned) triangulation on which results should be
    *   evaluated
    */
   RemoteQuadraturePointEvaluator(
     const std::vector<Point<spacedim>> quadrature_points,
-    const parallel::distributed::Triangulation<dim, spacedim> &tria)
+    const parallel::distributed::Triangulation<dim, spacedim> &tria,
+    const Mapping<dim, spacedim> &                             mapping,
+    const double                                               tolerance)
     : comm(tria.get_communicator())
   {
     // create bounding boxed of local active cells
     std::vector<BoundingBox<spacedim>> local_boxes;
     for (const auto cell : tria.active_cell_iterators())
       if (cell->is_locally_owned())
-        local_boxes.push_back(cell->bounding_box());
+        local_boxes.push_back(mapping.get_bounding_box(cell));
 
     // create r-tree of bounding boxes
-    const auto local_tree        = pack_rtree(local_boxes);
-    
+    const auto local_tree = pack_rtree(local_boxes);
+
     // compress r-tree to a minimal set of bounding boxes
     const auto local_reduced_box = extract_rtree_level(local_tree, 0);
 
@@ -50,15 +87,25 @@ public:
     const auto global_bounding_boxes =
       Utilities::MPI::all_gather(comm, local_reduced_box);
 
-    // determine ranks which might posses quadrature point 
-    std::vector<std::vector<Point<spacedim>>> points_per_process(
-      global_bounding_boxes.size());
+    // determine ranks which might poses quadrature point
+    auto points_per_process =
+      std::vector<std::vector<Point<spacedim>>>(global_bounding_boxes.size());
 
-    for (const auto &point : quadrature_points)
-      for (unsigned i = 0; i < global_bounding_boxes.size(); ++i)
-        for (const auto &box : global_bounding_boxes[i])
-          if (box.point_inside(point))
-            points_per_process[i].emplace_back(point);
+    auto points_per_process_offset =
+      std::vector<std::vector<unsigned int>>(global_bounding_boxes.size());
+
+    for (unsigned int i = 0; i < quadrature_points.size(); ++i)
+      {
+        const auto &point = quadrature_points[i];
+        for (unsigned rank = 0; rank < global_bounding_boxes.size(); ++rank)
+          for (const auto &box : global_bounding_boxes[rank])
+            if (box.point_inside(point))
+              {
+                points_per_process[rank].emplace_back(point);
+                points_per_process_offset[rank].emplace_back(i);
+                break;
+              }
+      }
 
     // only communicate with processes that might have a quadrature point
     std::vector<unsigned int> targets;
@@ -68,14 +115,63 @@ public:
           i != Utilities::MPI::this_mpi_process(comm))
         targets.emplace_back(i);
 
+
+    std::map<unsigned int, std::vector<Point<spacedim>>>
+      relevant_points_per_process;
+    std::map<unsigned int, std::vector<unsigned int>>
+      relevant_points_per_process_offset;
+    std::map<unsigned int, std::vector<unsigned int>>
+      relevant_points_per_process_count;
+
+
     // for local quadrature points no communication is needed...
-    local_quadrature_points =
-      points_per_process[Utilities::MPI::this_mpi_process(comm)];
+    {
+      const unsigned int my_rank = Utilities::MPI::this_mpi_process(comm);
+
+      const auto &potentially_local_points = points_per_process[my_rank];
+
+
+      {
+        std::vector<Point<spacedim>> points;
+        std::vector<unsigned int>    points_offset;
+        std::vector<unsigned int>    count;
+
+        const auto &potentially_relevant_points = points_per_process[my_rank];
+        const auto &potentially_relevant_points_offset =
+          points_per_process_offset[my_rank];
+
+        for (unsigned int j = 0; j < potentially_local_points.size(); ++j)
+          {
+            const unsigned int counter =
+              n_locally_owned_active_cells_around_point(
+                tria, mapping, potentially_relevant_points[j], tolerance);
+
+            if (counter > 0)
+              {
+                points.push_back(potentially_relevant_points[j]);
+                points_offset.push_back(potentially_relevant_points_offset[j]);
+                count.push_back(counter);
+              }
+          }
+
+
+        if (points.size() > 0)
+          {
+            relevant_remote_points_per_process[my_rank]       = points;
+            relevant_remote_points_count_per_process[my_rank] = count;
+
+            relevant_points_per_process[my_rank]        = points;
+            relevant_points_per_process_offset[my_rank] = points_offset;
+            relevant_points_per_process_count[my_rank]  = count;
+            map_recv[my_rank]                           = points;
+          }
+      }
+    }
 
     // send to remote ranks the requested quadrature points and eliminate
     // not needed ones (note: currently, we cannot communicate points ->
     // switch to doubles here)
-    Utilities::MPI::ConsensusAlgorithms::AnonymousProcess<double, double>
+    Utilities::MPI::ConsensusAlgorithms::AnonymousProcess<double, unsigned int>
       process(
         [&]() { return targets; },
         [&](const unsigned int other_rank, std::vector<double> &send_buffer) {
@@ -86,74 +182,148 @@ public:
         },
         [&](const unsigned int &       other_rank,
             const std::vector<double> &recv_buffer,
-            std::vector<double> &      request_buffer) {
+            std::vector<unsigned int> &request_buffer) {
           // received points, determine if point is actually possessed, and
           // send the result back
-            
-          std::vector<Point<spacedim>> points;
 
-          request_buffer.resize(recv_buffer.size());
+          std::vector<Point<spacedim>> relevant_remote_points;
+          std::vector<unsigned int>    relevant_remote_points_count;
 
-          for (unsigned int i = 0; i < recv_buffer.size(); i += spacedim)
+          request_buffer.clear();
+          request_buffer.resize(recv_buffer.size() / spacedim);
+
+          for (unsigned int i = 0, j = 0; i < recv_buffer.size();
+               i += spacedim, ++j)
             {
               Point<spacedim> point;
               for (unsigned int j = 0; j < spacedim; ++j)
                 point[j] = recv_buffer[i + j];
 
-              bool found = false;
+              const unsigned int counter =
+                n_locally_owned_active_cells_around_point(tria,
+                                                          mapping,
+                                                          point,
+                                                          tolerance);
 
-              for (const auto &box : local_boxes)
-                if (box.point_inside(point))
-                  {
-                    points.push_back(point);
+              request_buffer[j] = counter;
 
-                    for (unsigned int j = 0; j < spacedim; ++j)
-                      request_buffer[i + j] = recv_buffer[i + j];
-
-
-                    found = true;
-
-                    break;
-                  }
-
-              if (found)
-                continue;
-
-              for (unsigned int j = 0; j < spacedim; ++j)
-                request_buffer[i + j] = std::numeric_limits<double>::max();
+              if (counter > 0)
+                {
+                  relevant_remote_points.push_back(point);
+                  relevant_remote_points_count.push_back(counter);
+                }
             }
 
-          if (points.size() > 0)
-            map_send[other_rank] = points;
-        },
-        [&](const unsigned int other_rank, std::vector<double> &recv_buffer) {
-            // prepare buffer
-          recv_buffer.resize(spacedim * points_per_process[other_rank].size());
+          if (relevant_remote_points.size() > 0)
+            {
+              relevant_remote_points_per_process[other_rank] =
+                relevant_remote_points;
+              relevant_remote_points_count_per_process[other_rank] =
+                relevant_remote_points_count;
+            }
         },
         [&](const unsigned int         other_rank,
-            const std::vector<double> &recv_buffer) {
-          // receive points, which are actually owned by other process
+            std::vector<unsigned int> &recv_buffer) {
+          // prepare buffer
+          recv_buffer.resize(points_per_process[other_rank].size());
+        },
+        [&](const unsigned int               other_rank,
+            const std::vector<unsigned int> &recv_buffer) {
+          // store recv_buffer -> make the algorithm deterministic
+
+          const auto &potentially_relevant_points =
+            points_per_process[other_rank];
+          const auto &potentially_relevant_points_offset =
+            points_per_process_offset[other_rank];
+
           std::vector<Point<spacedim>> points;
+          std::vector<unsigned int>    points_offset;
+          std::vector<unsigned int>    count;
 
-          for (unsigned int i = 0; i < recv_buffer.size(); i += spacedim)
-            {
-              if (recv_buffer[i] == std::numeric_limits<double>::max())
-                continue;
+          AssertDimension(potentially_relevant_points.size(),
+                          recv_buffer.size());
+          AssertDimension(potentially_relevant_points_offset.size(),
+                          recv_buffer.size());
 
-              Point<spacedim> point;
-              for (unsigned int j = 0; j < spacedim; ++j)
-                point[j] = recv_buffer[i + j];
-
-              points.push_back(point);
-            }
+          for (unsigned int i = 0; i < recv_buffer.size(); ++i)
+            if (recv_buffer[i] > 0)
+              {
+                points.push_back(potentially_relevant_points[i]);
+                points_offset.push_back(potentially_relevant_points_offset[i]);
+                count.push_back(recv_buffer[i]);
+              }
 
           if (points.size() > 0)
-            map_recv[other_rank] = points;
+            {
+              relevant_points_per_process[other_rank]        = points;
+              relevant_points_per_process_offset[other_rank] = points_offset;
+              relevant_points_per_process_count[other_rank]  = count;
+              map_recv[other_rank]                           = points;
+            }
         });
 
-    Utilities::MPI::ConsensusAlgorithms::Selector<double, double>(
-      process, tria.comm)
+    Utilities::MPI::ConsensusAlgorithms::Selector<double, unsigned int>(process,
+                                                                        comm)
       .run();
+
+    quadrature_points_count.resize(quadrature_points.size(), 0);
+
+    for (const auto &i : relevant_points_per_process)
+      {
+        const unsigned int rank = i.first;
+
+        std::vector<std::pair<unsigned int, unsigned int>> indices;
+
+        const auto &relevant_points = relevant_points_per_process[rank];
+        const auto &relevant_points_offset =
+          relevant_points_per_process_offset[rank];
+        const auto &relevant_points_count =
+          relevant_points_per_process_count[rank];
+
+        for (unsigned int j = 0; j < relevant_points.size(); ++j)
+          {
+            for (unsigned int k = 0; k < relevant_points_count[j]; ++k)
+              {
+                AssertIndexRange(relevant_points_offset[j],
+                                 quadrature_points_count.size());
+                auto &qp_counter =
+                  quadrature_points_count[relevant_points_offset[j]];
+                indices.emplace_back(relevant_points_offset[j], qp_counter);
+
+                ++qp_counter;
+              }
+          }
+
+        this->indices_per_process[rank] = indices;
+      }
+  }
+
+  template <typename T>
+  void
+  init_surface_values(std::vector<std::vector<T>> &output) const
+  {
+    output.resize(quadrature_points_count.size());
+
+    for (unsigned int i = 0; i < quadrature_points_count.size(); ++i)
+      output[i].resize(quadrature_points_count[i]);
+  }
+
+  template <typename T>
+  void
+  init_intermediate_values(
+    std::map<unsigned int, std::vector<std::vector<T>>> &input) const
+  {
+    for (const auto &i : this->relevant_remote_points_count_per_process)
+      {
+        const unsigned int rank = i.first;
+
+        std::vector<std::vector<T>> temp(i.second.size());
+
+        for (unsigned int j = 0; j < i.second.size(); ++j)
+          temp[j].resize(i.second[j]);
+
+        input[rank] = temp;
+      }
   }
 
   /**
@@ -161,34 +331,24 @@ public:
    * is sorted according to rank.
    */
   template <typename T>
-  std::map<unsigned int, std::vector<T>>
-  process(const std::function<T(Point<spacedim>)> &fu) const
+  void
+  process(const std::map<unsigned int, std::vector<std::vector<T>>> &input,
+          std::vector<std::vector<T>> &output) const
   {
-    std::map<unsigned int, std::vector<T>> result;
-
-    // process local quadrature points
-    {
-      std::vector<T> temp;
-      temp.reserve(local_quadrature_points.size());
-      for (auto p : local_quadrature_points)
-        temp.push_back(fu(p));
-      result[Utilities::MPI::this_mpi_process(comm)] = temp;
-    }
-
     // process remote quadrature points and send them away
     std::map<unsigned int, std::vector<char>> temp_map;
 
     std::vector<MPI_Request> requests;
-    requests.reserve(map_send.size());
+    requests.reserve(input.size());
 
-    for (const auto &vec : map_send)
+    const unsigned int my_rank = Utilities::MPI::this_mpi_process(comm);
+
+    for (const auto &vec : input)
       {
-        std::vector<T> temp;
-        temp.reserve(vec.second.size());
+        if (vec.first == my_rank)
+          continue;
 
-        for (auto p : vec.second)
-          temp.push_back(fu(p));
-        temp_map[vec.first] = Utilities::pack(temp);
+        temp_map[vec.first] = Utilities::pack(vec.second);
 
         auto &buffer = temp_map[vec.first];
 
@@ -204,8 +364,18 @@ public:
       }
 
     // receive result
-    for (unsigned int counter = 0; counter < map_recv.size(); ++counter)
+
+    std::map<unsigned int, std::vector<std::vector<T>>> temp_recv_map;
+
+    // process locally-owned values
+    if (input.find(my_rank) != input.end())
+      temp_recv_map[my_rank] = input.at(my_rank);
+
+    for (const auto &vec : map_recv)
       {
+        if (vec.first == my_rank)
+          continue;
+
         MPI_Status status;
         MPI_Probe(MPI_ANY_SOURCE, 11, comm, &status);
 
@@ -222,26 +392,34 @@ public:
                  comm,
                  MPI_STATUS_IGNORE);
 
-        result[status.MPI_SOURCE] = Utilities::unpack<std::vector<T>>(buffer);
+        temp_recv_map[status.MPI_SOURCE] =
+          Utilities::unpack<std::vector<std::vector<T>>>(buffer);
       }
 
     MPI_Waitall(requests.size(), requests.data(), MPI_STATUSES_IGNORE);
 
-    return result;
+    for (const auto &i : temp_recv_map)
+      {
+        const unsigned int rank = i.first;
+
+        auto it = indices_per_process.at(rank).begin();
+
+        for (const auto &i : temp_recv_map[rank])
+          for (const auto &j : i)
+            {
+              output[it->first][it->second] = j;
+              ++it;
+            }
+      }
   }
 
   /**
    * Return quadrature points (sorted according to rank).
    */
-  std::map<unsigned int, std::vector<Point<spacedim>>>
-  get_quadrature_points() const
+  const std::map<unsigned int, std::vector<Point<spacedim>>> &
+  get_remote_quadrature_points() const
   {
-    auto result = map_recv;
-
-    result[Utilities::MPI::this_mpi_process(comm)] =
-      this->local_quadrature_points;
-
-    return result;
+    return relevant_remote_points_per_process;
   }
 
   /**
@@ -251,10 +429,6 @@ public:
   print() const
   {
     std::cout << "Locally owned quadrature points:" << std::endl;
-
-    for (const auto &point : local_quadrature_points)
-      std::cout << point << std::endl;
-    std::cout << std::endl;
 
     for (const auto &i : map_recv)
       {
@@ -266,7 +440,7 @@ public:
         std::cout << std::endl;
       }
 
-    for (const auto &i : map_send)
+    for (const auto &i : relevant_remote_points_per_process)
       {
         std::cout << "Send to " << i.first << ":" << std::endl;
 
@@ -280,22 +454,32 @@ public:
 private:
   const MPI_Comm &comm;
 
-  std::vector<Point<spacedim>>                         local_quadrature_points;
+  // receiver side
+  std::vector<unsigned int> quadrature_points_count;
+  std::map<unsigned int, std::vector<std::pair<unsigned int, unsigned int>>>
+                                                       indices_per_process;
   std::map<unsigned int, std::vector<Point<spacedim>>> map_recv;
-  std::map<unsigned int, std::vector<Point<spacedim>>> map_send;
+
+  // sender side (TODO: merge)
+  std::map<unsigned int, std::vector<Point<spacedim>>>
+    relevant_remote_points_per_process;
+  std::map<unsigned int, std::vector<unsigned int>>
+    relevant_remote_points_count_per_process;
 };
 
 template <int dim, int spacedim>
 void
 test(const MPI_Comm &comm)
 {
-  // 1) create mesh
+  // Ia) create mesh
   parallel::distributed::Triangulation<dim, spacedim> tria_solid(comm);
-  GridGenerator::hyper_ball(tria_solid);
+  GridGenerator::hyper_cube(tria_solid);
   tria_solid.refine_global(3);
 
   parallel::distributed::Triangulation<dim, spacedim> tria_fluid(comm);
-  GridGenerator::hyper_cube(tria_fluid, -2, 3);
+  GridGenerator::hyper_rectangle(tria_fluid,
+                                 Point<spacedim>(1, 0),
+                                 Point<spacedim>(2, 1));
   tria_fluid.refine_global(4);
 
   GridOut grid_out;
@@ -334,28 +518,49 @@ test(const MPI_Comm &comm)
         }
     }
 
-  // 3) setup communication pattern
-  RemoteQuadraturePointEvaluator<dim, spacedim> eval(surface_quadrature_points,
-                                                     tria_fluid);
+  // Ib) setup communication pattern
+  const RemoteQuadraturePointEvaluator<dim, spacedim> eval(
+    surface_quadrature_points, tria_fluid, mapping, 1.e-10);
 
-  // 4) get quadrature points (sorted according rank)
-  std::map<unsigned int, std::vector<Point<spacedim>>> results_points =
-    eval.get_quadrature_points();
+  // Ic) allocate memory
+  std::vector<std::vector<Tensor<1, spacedim>>> surface_values;
+  eval.init_surface_values(surface_values);
 
-  // 5) compute derived quantities at quadrature points and get results (sorted
-  // according rank)
-  std::map<unsigned int, std::vector<Tensor<1, spacedim>>> results_values =
-    eval.template process<Tensor<1, spacedim>>(
-      [](const auto &point) { return point; });
+  std::map<unsigned int, std::vector<std::vector<Tensor<1, spacedim>>>>
+    intermediate_values;
+  eval.init_intermediate_values(intermediate_values);
 
-  // 6) print results
-  for (const auto &ranks_and_points : results_points)
+  // IIa) fill intermediate values
+  const auto &remote_quadrature_point_per_process =
+    eval.get_remote_quadrature_points();
+
+  for (auto &p : intermediate_values)
     {
-      const auto &values = results_values[ranks_and_points.first];
+      const unsigned int rank   = p.first;
+      auto &             values = p.second;
+      const auto &       quadrature_points =
+        remote_quadrature_point_per_process.at(rank);
 
       for (unsigned int i = 0; i < values.size(); ++i)
-        std::cout << ranks_and_points.second[i] << " " << values[i]
-                  << std::endl;
+        for (unsigned int j = 0; j < values[i].size(); ++j)
+          values[i][j] = quadrature_points[i]; // TODO: do something useful
+    }
+
+  // IIb) communicate values
+  eval.process(/*src=*/intermediate_values, /*dst=*/surface_values);
+
+  // IIc) use surface values
+  for (unsigned int i = 0; i < surface_values.size(); ++i)
+    {
+      if (surface_values[i].size() == 0)
+        continue;
+
+      std::cout << surface_values[i].size() << " : "
+                << surface_quadrature_points[i] << " ";
+
+      for (const auto &value : surface_values[i])
+        std::cout << value << " ";
+
       std::cout << std::endl;
     }
 }

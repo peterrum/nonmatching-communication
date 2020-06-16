@@ -274,18 +274,18 @@ void create_triangulation_fluid(Triangulation<2> &tria)
 
 template <int dim>
 unsigned int
-n_locally_owned_active_cells_around_point(const Triangulation<dim> &tria,
-                                          const Mapping<dim> &      mapping,
-                                          const Point<dim> &        point,
-                                          const double              tolerance)
+n_locally_owned_active_cells_around_point(
+  const Triangulation<dim> &                         tria,
+  const Mapping<dim> &                               mapping,
+  const Point<dim> &                                 point,
+  const double                                       tolerance,
+  const std::vector<bool> &                          marked_vertices,
+  const GridTools::Cache<dim, dim> &                 cache,
+  typename Triangulation<dim>::active_cell_iterator &cell_hint)
 {
   using Pair =
     std::pair<typename Triangulation<dim>::active_cell_iterator, Point<dim>>;
-  std::vector<Pair>          adjacent_cells;
-  const std::vector<bool>    marked_vertices;
-  GridTools::Cache<dim, dim> cache(tria, mapping);
-
-  auto cell_hint = tria.begin_active();
+  std::vector<Pair> adjacent_cells;
 
   try
     {
@@ -402,6 +402,14 @@ public:
       relevant_points_per_process_count;
 
 
+
+    const std::vector<bool>          marked_vertices;
+    const GridTools::Cache<dim, dim> cache(tria, mapping);
+
+    typename Triangulation<dim>::active_cell_iterator cell_hint =
+      tria.begin_active();
+
+
     // for local quadrature points no communication is needed...
     {
       const unsigned int my_rank = Utilities::MPI::this_mpi_process(comm);
@@ -422,7 +430,13 @@ public:
           {
             const unsigned int counter =
               n_locally_owned_active_cells_around_point(
-                tria, mapping, potentially_relevant_points[j], tolerance);
+                tria,
+                mapping,
+                potentially_relevant_points[j],
+                tolerance,
+                marked_vertices,
+                cache,
+                cell_hint);
 
             if (counter > 0)
               {
@@ -481,7 +495,10 @@ public:
                 n_locally_owned_active_cells_around_point(tria,
                                                           mapping,
                                                           point,
-                                                          tolerance);
+                                                          tolerance,
+                                                          marked_vertices,
+                                                          cache,
+                                                          cell_hint);
 
               request_buffer[j] = counter;
 

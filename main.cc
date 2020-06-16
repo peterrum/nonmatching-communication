@@ -13,6 +13,7 @@
 #include <deal.II/grid/grid_generator.h>
 #include <deal.II/grid/grid_out.h>
 #include <deal.II/grid/grid_tools.h>
+#include <deal.II/grid/grid_tools_cache.h>
 
 #include <deal.II/numerics/rtree.h>
 
@@ -280,12 +281,36 @@ n_locally_owned_active_cells_around_point(const Triangulation<dim> &tria,
 {
   using Pair =
     std::pair<typename Triangulation<dim>::active_cell_iterator, Point<dim>>;
+  std::vector<Pair>          adjacent_cells;
+  const std::vector<bool>    marked_vertices;
+  GridTools::Cache<dim, dim> cache(tria, mapping);
 
-  std::vector<Pair> adjacent_cells =
-    GridTools::find_all_active_cells_around_point(mapping,
-                                                  tria,
-                                                  point,
-                                                  tolerance);
+  auto cell_hint = tria.begin_active();
+
+  try
+    {
+      const auto first_cell = GridTools::find_active_cell_around_point(
+        mapping, tria, point, marked_vertices, tolerance);
+      const auto second_cell = GridTools::find_active_cell_around_point(
+        mapping,
+        tria,
+        point,
+        cache.get_vertex_to_cell_map(),
+        cache.get_vertex_to_cell_centers_directions(),
+        cell_hint,
+        marked_vertices,
+        cache.get_used_vertices_rtree(),
+        tolerance);
+
+      cell_hint = first_cell.first;
+
+      adjacent_cells = GridTools::find_all_active_cells_around_point(
+        mapping, tria, point, tolerance, first_cell);
+    }
+  catch (...)
+    {
+      // TODO
+    }
 
   // count locally owned active cells
   unsigned int counter = 0;

@@ -18,6 +18,259 @@
 
 using namespace dealii;
 
+double const X_0    = 0.0;  // origin (x-coordinate)
+double const Y_0    = 0.0;  // origin (y-coordinate)
+double const L      = 2.5;  // x-coordinate of outflow boundary
+double const H      = 0.41; // height of channel
+double const X_C    = 0.2;  // center of cylinder (x-coordinate)
+double const Y_C    = 0.2;  // center of cylinder (y-coordinate)
+double const X_2    = 2.0 * X_C;
+double const D      = 0.1;                    // cylinder diameter
+double const R      = D / 2.0;                // cylinder radius
+double const T      = 0.02;                   // thickness of flag
+double const L_FLAG = 0.35;                   // length of flag
+double const X_3    = X_C + R + L_FLAG * 1.6; // only relevant for mesh
+double const Y_3    = H / 3.0;                // only relevant for mesh
+
+bool STRUCTURE_COVERS_FLAG_ONLY = true;
+
+
+void create_triangulation_structure(Triangulation<2> &tria)
+{
+  if (STRUCTURE_COVERS_FLAG_ONLY)
+    {
+      GridGenerator::subdivided_hyper_rectangle(
+        tria,
+        {8, 1} /* subdivisions x,y */,
+        Point<2>(X_C + R * std::cos(std::asin(T / (2.0 * R))), Y_C - T / 2.0),
+        Point<2>(X_C + R + L_FLAG, Y_C + T / 2.0));
+    }
+  else
+    {
+      std::vector<Triangulation<2>> tria_vec;
+
+      tria_vec.resize(12);
+
+      GridGenerator::general_cell(
+        tria_vec[0],
+        {Point<2>(X_C + R / std::sqrt(2.0), Y_C - R / std::sqrt(2.0)),
+         Point<2>(X_C + R * std::cos(std::asin(T / (2.0 * R))), Y_C - T / 2.0),
+         Point<2>(X_C + T / 2.0, Y_C - T),
+         Point<2>(X_C + T / 2.0 +
+                    (X_C + R * std::cos(std::asin(T / (2.0 * R))) -
+                     (X_C + T / 2.0)) /
+                      2.0,
+                  Y_C - T / 4.0)});
+
+      GridGenerator::general_cell(
+        tria_vec[1],
+        {Point<2>(X_C + T / 2.0, Y_C - T),
+         Point<2>(X_C + T / 2.0 +
+                    (X_C + R * std::cos(std::asin(T / (2.0 * R))) -
+                     (X_C + T / 2.0)) /
+                      2.0,
+                  Y_C - T / 4.0),
+         Point<2>(X_C + T / 2.0, Y_C + T),
+         Point<2>(X_C + T / 2.0 +
+                    (X_C + R * std::cos(std::asin(T / (2.0 * R))) -
+                     (X_C + T / 2.0)) /
+                      2.0,
+                  Y_C + T / 4.0)});
+
+      GridGenerator::general_cell(
+        tria_vec[2],
+        {Point<2>(X_C + T / 2.0 +
+                    (X_C + R * std::cos(std::asin(T / (2.0 * R))) -
+                     (X_C + T / 2.0)) /
+                      2.0,
+                  Y_C - T / 4.0),
+         Point<2>(X_C + R * std::cos(std::asin(T / (2.0 * R))), Y_C - T / 2.0),
+         Point<2>(X_C + T / 2.0 +
+                    (X_C + R * std::cos(std::asin(T / (2.0 * R))) -
+                     (X_C + T / 2.0)) /
+                      2.0,
+                  Y_C + T / 4.0),
+         Point<2>(X_C + R * std::cos(std::asin(T / (2.0 * R))),
+                  Y_C + T / 2.0)});
+
+      GridGenerator::general_cell(
+        tria_vec[3],
+        {Point<2>(X_C + T / 2.0 +
+                    (X_C + R * std::cos(std::asin(T / (2.0 * R))) -
+                     (X_C + T / 2.0)) /
+                      2.0,
+                  Y_C + T / 4.0),
+         Point<2>(X_C + R * std::cos(std::asin(T / (2.0 * R))), Y_C + T / 2.0),
+         Point<2>(X_C + T / 2.0, Y_C + T),
+         Point<2>(X_C + R / std::sqrt(2.0), Y_C + R / std::sqrt(2.0))});
+
+      GridGenerator::general_cell(tria_vec[4],
+                                  {Point<2>(X_C - T / 2.0, Y_C - T),
+                                   Point<2>(X_C + T / 2.0, Y_C - T),
+                                   Point<2>(X_C - T / 2.0, Y_C + T),
+                                   Point<2>(X_C + T / 2.0, Y_C + T)});
+
+      GridGenerator::general_cell(
+        tria_vec[5],
+        {Point<2>(X_C - R / std::sqrt(2.0), Y_C - R / std::sqrt(2.0)),
+         Point<2>(X_C + R / std::sqrt(2.0), Y_C - R / std::sqrt(2.0)),
+         Point<2>(X_C - T / 2.0, Y_C - T),
+         Point<2>(X_C + T / 2.0, Y_C - T)});
+
+      GridGenerator::general_cell(
+        tria_vec[6],
+        {Point<2>(X_C - T / 2.0, Y_C + T),
+         Point<2>(X_C + T / 2.0, Y_C + T),
+         Point<2>(X_C - R / std::sqrt(2.0), Y_C + R / std::sqrt(2.0)),
+         Point<2>(X_C + R / std::sqrt(2.0), Y_C + R / std::sqrt(2.0))});
+
+      GridGenerator::general_cell(
+        tria_vec[7],
+        {Point<2>(X_C - R / std::sqrt(2.0), Y_C - R / std::sqrt(2.0)),
+         Point<2>(X_C - T / 2.0, Y_C - T),
+         Point<2>(X_C - R * std::cos(std::asin(T / (2.0 * R))), Y_C - T / 2.0),
+         Point<2>(X_C - T / 2.0 -
+                    (X_C + R * std::cos(std::asin(T / (2.0 * R))) -
+                     (X_C + T / 2.0)) /
+                      2.0,
+                  Y_C - T / 4.0)});
+
+      GridGenerator::general_cell(
+        tria_vec[8],
+        {Point<2>(X_C - T / 2.0 -
+                    (X_C + R * std::cos(std::asin(T / (2.0 * R))) -
+                     (X_C + T / 2.0)) /
+                      2.0,
+                  Y_C - T / 4.0),
+         Point<2>(X_C - T / 2.0, Y_C - T),
+         Point<2>(X_C - T / 2.0 -
+                    (X_C + R * std::cos(std::asin(T / (2.0 * R))) -
+                     (X_C + T / 2.0)) /
+                      2.0,
+                  Y_C + T / 4.0),
+         Point<2>(X_C - T / 2.0, Y_C + T)});
+
+      GridGenerator::general_cell(
+        tria_vec[9],
+        {Point<2>(X_C - R * std::cos(std::asin(T / (2.0 * R))), Y_C - T / 2.0),
+         Point<2>(X_C - T / 2.0 -
+                    (X_C + R * std::cos(std::asin(T / (2.0 * R))) -
+                     (X_C + T / 2.0)) /
+                      2.0,
+                  Y_C - T / 4.0),
+         Point<2>(X_C - R * std::cos(std::asin(T / (2.0 * R))), Y_C + T / 2.0),
+         Point<2>(X_C - T / 2.0 -
+                    (X_C + R * std::cos(std::asin(T / (2.0 * R))) -
+                     (X_C + T / 2.0)) /
+                      2.0,
+                  Y_C + T / 4.0)});
+
+      GridGenerator::general_cell(
+        tria_vec[10],
+        {Point<2>(X_C - R * std::cos(std::asin(T / (2.0 * R))), Y_C + T / 2.0),
+         Point<2>(X_C - T / 2.0 -
+                    (X_C + R * std::cos(std::asin(T / (2.0 * R))) -
+                     (X_C + T / 2.0)) /
+                      2.0,
+                  Y_C + T / 4.0),
+         Point<2>(X_C - R / std::sqrt(2.0), Y_C + R / std::sqrt(2.0)),
+         Point<2>(X_C - T / 2.0, Y_C + T)});
+
+      GridGenerator::subdivided_hyper_rectangle(
+        tria_vec[11],
+        {8, 1} /* subdivisions x,y */,
+        Point<2>(X_C + R * std::cos(std::asin(T / (2.0 * R))), Y_C - T / 2.0),
+        Point<2>(X_C + R + L_FLAG, Y_C + T / 2.0));
+
+      std::vector<Triangulation<2> const *> tria_vec_ptr(tria_vec.size());
+      for (unsigned int i = 0; i < tria_vec.size(); ++i)
+        tria_vec_ptr[i] = &tria_vec[i];
+
+      GridGenerator::merge_triangulations(tria_vec_ptr, tria);
+    }
+}
+
+void create_triangulation_fluid(Triangulation<2> &tria)
+{
+  std::vector<Triangulation<2>> tria_vec;
+  tria_vec.resize(11);
+
+  GridGenerator::general_cell(
+    tria_vec[0],
+    {Point<2>(X_0, 0.0),
+     Point<2>(X_C - R / std::sqrt(2.0), Y_C - R / std::sqrt(2.0)),
+     Point<2>(X_0, H),
+     Point<2>(X_C - R / std::sqrt(2.0), Y_C + R / std::sqrt(2.0))});
+
+  GridGenerator::general_cell(
+    tria_vec[1],
+    {Point<2>(X_0, 0.0),
+     Point<2>(X_2, 0.0),
+     Point<2>(X_C - R / std::sqrt(2.0), Y_C - R / std::sqrt(2.0)),
+     Point<2>(X_C + R / std::sqrt(2.0), Y_C - R / std::sqrt(2.0))});
+
+  GridGenerator::general_cell(
+    tria_vec[2],
+    {Point<2>(X_C - R / std::sqrt(2.0), Y_C + R / std::sqrt(2.0)),
+     Point<2>(X_C + R / std::sqrt(2.0), Y_C + R / std::sqrt(2.0)),
+     Point<2>(X_0, H),
+     Point<2>(X_2, H)});
+
+  GridGenerator::general_cell(
+    tria_vec[3],
+    {Point<2>(X_C + R / std::sqrt(2.0), Y_C - R / std::sqrt(2.0)),
+     Point<2>(X_2, 0.0),
+     Point<2>(X_C + R * std::cos(std::asin(T / (2.0 * R))), Y_C - T / 2.0),
+     Point<2>(X_2, Y_C - T / 2.0)});
+
+  GridGenerator::general_cell(
+    tria_vec[4],
+    {Point<2>(X_C + R * std::cos(std::asin(T / (2.0 * R))), Y_C + T / 2.0),
+     Point<2>(X_2, Y_C + T / 2.0),
+     Point<2>(X_C + R / std::sqrt(2.0), Y_C + R / std::sqrt(2.0)),
+     Point<2>(X_2, H)});
+
+  GridGenerator::subdivided_hyper_rectangle(tria_vec[5],
+                                            {1, 1} /* subdivisions x,y */,
+                                            Point<2>(X_2, 0.0),
+                                            Point<2>(X_C + R + L_FLAG,
+                                                     Y_C - T / 2.0));
+
+  GridGenerator::subdivided_hyper_rectangle(tria_vec[6],
+                                            {1, 1} /* subdivisions x,y */,
+                                            Point<2>(X_2, Y_C + T / 2.0),
+                                            Point<2>(X_C + R + L_FLAG, H));
+
+  GridGenerator::general_cell(tria_vec[7],
+                              {Point<2>(X_C + R + L_FLAG, 0.0),
+                               Point<2>(X_3, 0.0),
+                               Point<2>(X_C + R + L_FLAG, Y_C - T / 2.0),
+                               Point<2>(X_3, Y_3)});
+
+  GridGenerator::general_cell(tria_vec[8],
+                              {Point<2>(X_C + R + L_FLAG, Y_C + T / 2.0),
+                               Point<2>(X_3, 2.0 * Y_3),
+                               Point<2>(X_C + R + L_FLAG, H),
+                               Point<2>(X_3, H)});
+
+  GridGenerator::general_cell(tria_vec[9],
+                              {Point<2>(X_C + R + L_FLAG, Y_C - T / 2.0),
+                               Point<2>(X_3, Y_3),
+                               Point<2>(X_C + R + L_FLAG, Y_C + T / 2.0),
+                               Point<2>(X_3, 2.0 * Y_3)});
+
+  GridGenerator::subdivided_hyper_rectangle(tria_vec[10],
+                                            {8, 3} /* subdivisions x,y */,
+                                            Point<2>(X_3, 0.0),
+                                            Point<2>(L, H));
+
+  std::vector<Triangulation<2> const *> tria_vec_ptr(tria_vec.size());
+  for (unsigned int i = 0; i < tria_vec.size(); ++i)
+    tria_vec_ptr[i] = &tria_vec[i];
+
+  GridGenerator::merge_triangulations(tria_vec_ptr, tria);
+}
+
 template <int dim>
 unsigned int
 n_locally_owned_active_cells_around_point(const Triangulation<dim> &tria,
@@ -305,7 +558,7 @@ public:
     output.resize(quadrature_points_count.size());
 
     for (unsigned int i = 0; i < quadrature_points_count.size(); ++i)
-      output[i].resize(quadrature_points_count[i]);
+      output[i].assign(quadrature_points_count[i], T());
   }
 
   template <typename T>
@@ -473,14 +726,12 @@ test(const MPI_Comm &comm)
 {
   // Ia) create mesh
   parallel::distributed::Triangulation<dim, spacedim> tria_solid(comm);
-  GridGenerator::hyper_cube(tria_solid);
-  tria_solid.refine_global(3);
+  create_triangulation_structure(tria_solid);
+  // tria_solid.refine_global(3);
 
   parallel::distributed::Triangulation<dim, spacedim> tria_fluid(comm);
-  GridGenerator::hyper_rectangle(tria_fluid,
-                                 Point<spacedim>(1, 0),
-                                 Point<spacedim>(2, 1));
-  tria_fluid.refine_global(4);
+  create_triangulation_fluid(tria_fluid);
+  // tria_fluid.refine_global(4);
 
   GridOut grid_out;
 
